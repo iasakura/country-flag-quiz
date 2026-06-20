@@ -356,10 +356,6 @@ function acceptedAnswers(country) {
   return [country.ja, country.en, ...(country.a || [])].map(normalize);
 }
 
-// 正規化した国名/別名 → 国コード の逆引き。音声モードで「別の国を言った＝不正解」を判定するのに使う。
-const ANSWER_INDEX = new Map();
-for (const _c of COUNTRIES) for (const _a of acceptedAnswers(_c)) if (_a && !ANSWER_INDEX.has(_a)) ANSWER_INDEX.set(_a, _c.c);
-
 // 簡易レーベンシュタイン距離（1文字程度の誤認識・タイプミスを許容するため）。
 function lev(a, b) {
   const m = a.length, n = b.length;
@@ -420,6 +416,16 @@ function fmtArea(n) {
 
 const STORE_KEY = "flagquiz:stats:v1";
 const WEAK_KEY = "flagquiz:weak:v1"; // 手動登録の苦手リスト（コード配列）
+const RANK_KEY = "flagquiz:ranks:v1"; // タイムアタックの自己ベスト（"cat|mode" -> 記録配列）
+const WRONG_PENALTY_MS = 10000; // タイムアタック: 不正解1問あたりの加算ペナルティ
+
+// ミリ秒を「分:秒.1」/「秒.1秒」表記に整形
+function fmtTime(ms) {
+  const s = Math.max(0, ms || 0) / 1000;
+  const m = Math.floor(s / 60);
+  const rem = s - m * 60;
+  return m > 0 ? `${m}:${rem.toFixed(1).padStart(4, "0")}` : `${rem.toFixed(1)}秒`;
+}
 
 export default function App() {
   const [stats, setStats] = useState({}); // code -> {wrong, correct, seen, box, due}
@@ -429,6 +435,9 @@ export default function App() {
   const [mode, setMode] = useState("choice"); // choice | input
   const [notice, setNotice] = useState(""); // ホームに出す一言（復習完了など）
   const [result, setResult] = useState(null); // セッション結果 {correct,total,wrong:[code],cat,label,qmode}
+  const [ranks, setRanks] = useState({}); // タイムアタック自己ベスト
+  const [timed, setTimed] = useState(false); // 現在のセッションがタイムアタックか（表示用）
+  const [nowTick, setNowTick] = useState(0); // ライブタイマー再描画用
 
   // quiz state
   const orderRef = useRef([]);
@@ -438,6 +447,10 @@ export default function App() {
   const sessionRef = useRef({ correct: 0, total: 0 }); // 終了時のスコア参照用
   const sessionWrongRef = useRef([]); // このセッションで間違えたcode（重複なし）
   const configRef = useRef(null); // 直近のセッション設定（もう一度用）
+  const timeAttackRef = useRef(false); // 同期参照用（nextQuestion等）
+  const elapsedRef = useRef(0); // 確定済み問題の所要時間の累計(ms)
+  const qShownAtRef = useRef(0); // 現在の問題の計測開始時刻（0=計測停止中＝遷移/ロード中）
+  const penaltyRef = useRef(0); // 誤答ペナルティの累計(ms)
   const [catLabel, setCatLabel] = useState("");
   const [current, setCurrent] = useState(null);
   const [options, setOptions] = useState([]);
@@ -464,9 +477,22 @@ export default function App() {
       } catch (e) {
         /* no weak list yet */
       }
+      try {
+        const rk = await DB.get(RANK_KEY);
+        if (rk && rk.value) setRanks(JSON.parse(rk.value));
+      } catch (e) {
+        /* no ranks yet */
+      }
       setLoaded(true);
     })();
   }, []);
+
+  // タイムアタック中のライブタイマー（100msごとに再描画）
+  useEffect(() => {
+    if (screen !== "quiz" || !timed) return;
+    const id = setInterval(() => setNowTick((n) => n + 1), 100);
+    return () => clearInterval(id);
+  }, [screen, timed]);
 
   async function persist(next) {
     setStats(next);
@@ -491,6 +517,25 @@ export default function App() {
   }
   function removeWeak(code) {
     persistWeak(weakSet.filter((c) => c !== code));
+  }
+
+  async function persistRanks(next) {
+    setRanks(next);
+    try {
+      await DB.set(RANK_KEY, JSON.stringify(next));
+    } catch (e) {
+      /* ignore */
+    }
+  }
+
+  // 走破完了時に自己ベストへ記録（実時間＋累計ペナルティ）。
+  function saveRank(cat, cfg, timeMs, penaltyMs, sc) {
+    const key = `${cat}|${cfg.qmode}`;
+    const rec = { timeMs, penaltyMs, total: sc.total, correct: sc.correct, date: Date.now() };
+    const list = [...(ranks[key] || []), rec].sort((a, b) => a.timeMs - b.timeMs).slice(0, 5);
+    const position = list.indexOf(rec); // 上位5に入らなければ -1
+    persistRanks({ ...ranks, [key]: list });
+    return { key, timeMs, penaltyMs, position, best: position === 0, list };
   }
 
   const seenCount = useMemo(() => Object.values(stats).reduce((n, s) => n + (s.seen || 0), 0), [stats]);
@@ -535,13 +580,18 @@ export default function App() {
     return COUNTRIES.filter((x) => x.r === cat); // region key
   }
 
-  function startQuiz(cat, label, qmode) {
+  function startQuiz(cat, label, qmode, timedRun = false) {
     const pool = poolFor(cat);
     if (pool.length === 0) return;
     setMode(qmode);
     catRef.current = cat;
     learnRef.current = false;
-    configRef.current = { learn: false, cat, label, qmode };
+    timeAttackRef.current = timedRun;
+    setTimed(timedRun);
+    elapsedRef.current = 0;
+    qShownAtRef.current = 0;
+    penaltyRef.current = 0;
+    configRef.current = { learn: false, cat, label, qmode, timed: timedRun };
     setCatLabel(label);
     orderRef.current = shuffle(pool);
     ptrRef.current = 0;
@@ -573,6 +623,8 @@ export default function App() {
     setMode(qmode);
     catRef.current = scope;
     learnRef.current = true;
+    timeAttackRef.current = false;
+    setTimed(false);
     configRef.current = { learn: true, cat: scope, label, qmode };
     setCatLabel(`覚える · ${label}`);
     orderRef.current = shuffle(queue); // 地域を混ぜて出題（インターリーブ）
@@ -588,8 +640,8 @@ export default function App() {
     const order = orderRef.current;
     if (order.length === 0) return;
     if (ptrRef.current >= order.length) {
-      if (learnRef.current) {
-        endSession(); // 覚えるモードは期限ぶんを終えたら結果へ
+      if (learnRef.current || timeAttackRef.current) {
+        endSession(true); // 覚える/タイムアタックは一周したら結果へ
         return;
       }
       orderRef.current = shuffle(order);
@@ -604,6 +656,7 @@ export default function App() {
     setWasCorrect(false);
     setRevealed(false);
     setText("");
+    qShownAtRef.current = Date.now(); // この問題の計測開始（遷移/ロード時間は含めない）
 
     // 選択肢は両モードで用意（入力モードの「わからない→選択肢」用）。
     // 苦手・間違えがちは対象が少ないので誤答は同地域から作る。
@@ -623,13 +676,26 @@ export default function App() {
     }
   }
 
-  function endSession() {
+  function endSession(completed = false) {
     const sc = sessionRef.current;
+    const cfg = configRef.current;
+    const timedRun = !!(cfg && cfg.timed);
+    const penaltyMs = penaltyRef.current;
+    const totalMs = timedRun ? elapsedRef.current + (qShownAtRef.current ? Date.now() - qShownAtRef.current : 0) + penaltyMs : null;
+    // タイムアタックを最後まで走り切ったときだけ自己ベストに記録
+    const rank = timedRun && completed ? saveRank(catRef.current, cfg, totalMs, penaltyMs, sc) : null;
+    timeAttackRef.current = false;
+    setTimed(false);
     setResult({
       correct: sc.correct,
       total: sc.total,
       wrong: sessionWrongRef.current.slice(),
-      config: configRef.current,
+      config: cfg,
+      timed: timedRun,
+      completed,
+      timeMs: totalMs,
+      penaltyMs,
+      rank,
     });
     setScreen("result");
   }
@@ -662,6 +728,10 @@ export default function App() {
 
   function resolve(correct, pickedVal) {
     if (resolved) return;
+    if (timeAttackRef.current) {
+      if (!correct) penaltyRef.current += WRONG_PENALTY_MS; // 不正解で即ペナルティ加算
+      if (qShownAtRef.current) { elapsedRef.current += Date.now() - qShownAtRef.current; qShownAtRef.current = 0; } // 計測停止（以降の遷移は含めない）
+    }
     setResolved(true);
     setWasCorrect(correct);
     setPicked(pickedVal);
@@ -686,6 +756,12 @@ export default function App() {
     const val = typeof override === "string" ? override : text;
     if (resolved || !val.trim()) return;
     resolve(!!matchAccepted(val, current), val.trim());
+  }
+
+  // 「わからない」/ タイムアタックの10秒タイムアウト → 不正解にして次へ
+  function giveUp() {
+    if (resolved) return;
+    resolve(false, "わからない");
   }
 
   async function resetStats() {
@@ -740,10 +816,13 @@ export default function App() {
             setText={setText}
             inputRef={inputRef}
             session={session}
+            timed={timed}
+            elapsedMs={timed ? elapsedRef.current + (qShownAtRef.current ? Date.now() - qShownAtRef.current : 0) + penaltyRef.current : 0}
             onChoice={answerChoice}
             onInput={answerInput}
+            onGiveUp={giveUp}
             onNext={() => nextQuestion()}
-            onQuit={endSession}
+            onQuit={() => endSession(false)}
           />
         )}
 
@@ -756,7 +835,7 @@ export default function App() {
               const cfg = result.config;
               if (!cfg) return setScreen("home");
               if (cfg.learn) startLearn(cfg.cat, cfg.label, cfg.qmode);
-              else startQuiz(cfg.cat, cfg.label, cfg.qmode);
+              else startQuiz(cfg.cat, cfg.label, cfg.qmode, cfg.timed);
             }}
             onHome={() => setScreen("home")}
           />
@@ -824,7 +903,9 @@ function Header({ screen, onHome, onStats, onAtlas }) {
 function Home({ stats, counts, srs, notice, onDismissNotice, onStart, onLearn }) {
   const [mode, setMode] = useState("choice");
   const [scope, setScope] = useState(["all", "すべて"]);
+  const [taScope, setTaScope] = useState(["all", "すべて"]); // タイムアタックのカテゴリ
   const speechSupported = typeof window !== "undefined" && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
+  const modeLabel = mode === "choice" ? "選択式" : mode === "voice" ? "音声式" : "入力式";
 
   const regionBtns = Object.entries(R);
   const learnScopes = [["all", "すべて"], ...regionBtns.map(([k, l]) => [k, l]), ["muslim", "イスラム圏"]];
@@ -849,6 +930,33 @@ function Home({ stats, counts, srs, notice, onDismissNotice, onStart, onLearn })
             <Toggle active={mode === "voice"} onClick={() => setMode("voice")} title="音声式" sub="ハンズフリー" />
           )}
         </div>
+      </section>
+
+      {/* タイムアタック（専用モード） */}
+      <section className="rounded-2xl border border-rose-700/60 bg-rose-500/5 p-4 space-y-3">
+        <div>
+          <div className="text-xs tracking-[0.2em] text-rose-300 uppercase">⏱ タイムアタック</div>
+          <div className="text-sm text-slate-300">カテゴリを走破する実時間で競う。止まらず連続出題、不正解は +10秒。自己ベストを記録。</div>
+        </div>
+        <div className="flex flex-wrap gap-1.5">
+          {learnScopes.map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setTaScope([key, label])}
+              className={`px-3 py-1.5 rounded-full text-sm border transition ${
+                taScope[0] === key ? "bg-rose-500 border-rose-500 text-white" : "border-slate-700 text-slate-300 hover:border-rose-500"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <button
+          onClick={() => onStart(taScope[0], taScope[1], mode, true)}
+          className="w-full rounded-xl bg-rose-500 px-4 py-3.5 font-semibold text-white hover:bg-rose-400 transition"
+        >
+          {taScope[1]}でタイムアタック（{modeLabel}）
+        </button>
       </section>
 
       {/* 覚えるモード（間隔反復） */}
@@ -1011,13 +1119,18 @@ function useSpeechRecognition({ lang = "ja-JP", onInterim, onResult } = {}) {
 }
 
 function Quiz({
-  mode, catLabel, country, options, resolved, wasCorrect, picked, revealed, onReveal, hook, text, setText, inputRef, session, onChoice, onInput, onNext, onQuit,
+  mode, catLabel, country, options, resolved, wasCorrect, picked, revealed, onReveal, hook, text, setText, inputRef, session, timed, elapsedMs, onChoice, onInput, onGiveUp, onNext, onQuit,
 }) {
   const acc = session.total > 0 ? Math.round((session.correct / session.total) * 100) : 0;
   const [showInfo, setShowInfo] = useState(false);
   useEffect(() => setShowInfo(false), [country.c]); // 問題が変わったら閉じる
 
   const handsFree = mode === "voice"; // 音声モード（マイクボタン不要・自動で聞き取り）
+
+  // タイムアタック: 各問の開始時刻（10秒タイムアウト＆カウントダウン用）。描画中に問題が変わったら更新。
+  const qStartRef = useRef(0);
+  const lastCRef = useRef(null);
+  if (lastCRef.current !== country.c) { lastCRef.current = country.c; qStartRef.current = Date.now(); }
 
   // 音声入力: 認識結果を正解と照合し、一致すれば即回答。確定(isFinal)は無音検出を待つぶん遅いので、
   // 暫定結果(interim)が一致した時点で即確定する。
@@ -1029,15 +1142,9 @@ function Quiz({
     },
     onResult: (best, rest) => {
       setText(best);
-      const alts = [best, ...rest];
-      const correct = alts.find((a) => matchAccepted(a, country));
-      if (correct) { onInput(correct); return; }
-      // 音声モードのみ: 別の国としてはっきり認識できたら不正解として記録。
-      // どの国にも一致しない（聞き取り不良）ときは確定せず、聞き取りを継続する。
-      if (handsFree) {
-        const wrong = alts.find((a) => ANSWER_INDEX.has(normalize(a)));
-        if (wrong) onInput(wrong);
-      }
+      const hit = [best, ...rest].find((a) => matchAccepted(a, country));
+      if (hit) onInput(hit);
+      // 正解に一致しないときは確定せず聞き取りを継続（別の国を言っても不正解にしない）
     },
   });
 
@@ -1049,14 +1156,36 @@ function Quiz({
     return () => clearTimeout(id);
   }, [handsFree, resolved, voice.listening, voice.error, country.c]);
 
-  // 音声モード: 確定したら聞き取りを止め、正解なら自動で次へ（不正解は学習のため手動で進める）。
+  // 音声モード: 確定したら聞き取りを止める。
   useEffect(() => {
-    if (!handsFree || !resolved) return;
-    voice.stop();
-    if (!wasCorrect) return;
-    const id = setTimeout(() => onNext(), 1400);
+    if (handsFree && resolved) voice.stop();
+  }, [handsFree, resolved]);
+
+  // 自動で次へ: タイムアタックは正誤に関わらず自動進行（不正解は +10秒エフェクトを少し見せる）。
+  // 音声モード(非タイムアタック)は正解時のみ自動で進む。
+  useEffect(() => {
+    if (!resolved) return;
+    let delay = null;
+    if (timed) delay = wasCorrect ? 650 : 1150;
+    else if (handsFree && wasCorrect) delay = 1400;
+    if (delay == null) return;
+    const id = setTimeout(() => onNext(), delay);
     return () => clearTimeout(id);
-  }, [handsFree, resolved, wasCorrect]);
+  }, [timed, handsFree, resolved, wasCorrect]);
+
+  // タイムアタック: 5 秒経過したら選択肢を強制表示（ヒント）。
+  useEffect(() => {
+    if (!timed || resolved || revealed) return;
+    const id = setTimeout(() => onReveal(), Math.max(0, 5000 - (Date.now() - qStartRef.current)));
+    return () => clearTimeout(id);
+  }, [timed, resolved, revealed, country.c]);
+
+  // タイムアタック: 各問 10 秒で自動的に不正解（タイムアウト）。
+  useEffect(() => {
+    if (!timed || resolved) return;
+    const id = setTimeout(() => onGiveUp(), Math.max(0, 10000 - (Date.now() - qStartRef.current)));
+    return () => clearTimeout(id);
+  }, [timed, resolved, country.c]);
 
   const optionsGrid = (
     <div className="grid grid-cols-1 gap-2">
@@ -1083,12 +1212,29 @@ function Quiz({
 
   return (
     <div className="space-y-5">
+      {/* 不正解エフェクト（タイムアタック）: +10秒 */}
+      {timed && resolved && !wasCorrect && (
+        <div className="pointer-events-none fixed inset-0 z-50 flex items-center justify-center bg-rose-950/40">
+          <div className="rounded-3xl bg-rose-600 px-10 py-7 text-center shadow-2xl shadow-rose-900/50 animate-pulse">
+            <div className="text-6xl font-black text-white">+10秒</div>
+            <div className="mt-2 text-lg text-rose-100">正解: {country.ja}</div>
+          </div>
+        </div>
+      )}
+
       <div className="flex items-center justify-between text-sm">
         <span className="px-3 py-1 rounded-full bg-slate-800 text-slate-300">{catLabel} · {mode === "choice" ? "選択式" : mode === "voice" ? "音声式" : "入力式"}</span>
-        <span className="text-slate-400">
-          {session.correct}/{session.total}（{acc}%）
-        </span>
+        <span className="text-slate-400">{session.correct}/{session.total}（{acc}%）</span>
       </div>
+
+      {/* タイムアタック: 大きなタイマー */}
+      {timed && (
+        <div className="text-center">
+          <div className={`font-mono tabular-nums font-black text-6xl tracking-tight leading-none ${resolved && !wasCorrect ? "text-rose-400" : "text-indigo-300"}`}>
+            {fmtTime(elapsedMs)}
+          </div>
+        </div>
+      )}
 
       {/* 国旗ステージ */}
       <div className="rounded-2xl bg-slate-100 p-5 shadow-2xl shadow-black/40 flex items-center justify-center">
@@ -1099,9 +1245,16 @@ function Quiz({
         />
       </div>
 
+      {/* タイムアタック: 残り時間バー（10秒） */}
+      {timed && !resolved && (
+        <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+          <div className="h-full bg-rose-500" style={{ width: `${Math.max(0, 10000 - (Date.now() - qStartRef.current)) / 100}%` }} />
+        </div>
+      )}
+
       {/* 回答エリア */}
       {mode === "choice" ? (
-        !revealed ? (
+        !revealed && !timed ? (
           <button
             onClick={onReveal}
             className="w-full rounded-xl border border-indigo-500 bg-indigo-500/15 px-4 py-4 font-semibold text-indigo-200 hover:bg-indigo-500/25 transition"
@@ -1174,13 +1327,13 @@ function Quiz({
                 : "音声認識に失敗しました。もう一度お試しください"}
             </p>
           )}
-          {/* わからないとき: 選択肢にフォールバック */}
-          {!resolved && !revealed && (
+          {/* ヒント: 選択肢を表示（タイムアタックでは出さない） */}
+          {!resolved && !revealed && !timed && (
             <button
               onClick={onReveal}
               className="w-full rounded-xl border border-slate-700 px-4 py-2.5 text-sm text-slate-300 hover:border-indigo-500 hover:text-indigo-200 transition"
             >
-              わからない → 選択肢を見る
+              ヒント: 選択肢を見る
             </button>
           )}
           {revealed && optionsGrid}
@@ -1188,8 +1341,18 @@ function Quiz({
         </div>
       )}
 
-      {/* フィードバック */}
-      {resolved && (
+      {/* わからない: どのモードでも不正解にして次へ */}
+      {!resolved && (
+        <button
+          onClick={onGiveUp}
+          className="w-full rounded-xl border border-slate-700 px-4 py-2.5 text-sm text-slate-400 hover:border-rose-600 hover:text-rose-300 transition"
+        >
+          わからない（不正解にして次へ）
+        </button>
+      )}
+
+      {/* フィードバック（タイムアタックは止めずにエフェクトのみ） */}
+      {resolved && !timed && (
         <div
           className={`rounded-xl px-4 py-3 ${
             wasCorrect ? "bg-emerald-500/15 border border-emerald-600" : "bg-rose-500/15 border border-rose-600"
@@ -1212,7 +1375,7 @@ function Quiz({
       )}
 
       {/* 基本情報（回答後に開ける） */}
-      {resolved && (
+      {resolved && !timed && (
         <div>
           <button
             onClick={() => setShowInfo((v) => !v)}
@@ -1226,7 +1389,7 @@ function Quiz({
 
       {/* フッター操作 */}
       <div className="flex gap-2">
-        {resolved && (
+        {resolved && !timed && (
           <button
             onClick={onNext}
             autoFocus
@@ -1370,6 +1533,40 @@ function Result({ result, weakSet, onRegister, onAgain, onHome }) {
         <div className="text-4xl font-bold mt-1">{result.correct}<span className="text-slate-500 text-2xl"> / {result.total}</span></div>
         <div className="text-sm text-slate-400">正答率 {acc}%</div>
       </div>
+
+      {result.timed && (
+        <div className="rounded-xl border border-indigo-700 bg-indigo-500/10 px-4 py-3 space-y-1">
+          <div className="text-center">
+            <div className="text-xs tracking-[0.3em] uppercase text-indigo-300">Time Attack{result.completed ? "" : "（中断）"}</div>
+            <div className="text-4xl font-black font-mono tabular-nums mt-0.5">
+              {fmtTime(result.timeMs)}
+            </div>
+            {result.penaltyMs > 0 && (
+              <div className="text-xs text-slate-400">
+                実時間 {fmtTime(result.timeMs - result.penaltyMs)} ＋ 誤答ペナルティ {fmtTime(result.penaltyMs)}（{result.total - result.correct}問）
+              </div>
+            )}
+            {result.rank && result.rank.best && <div className="text-amber-400 font-semibold text-sm mt-0.5">🏆 自己ベスト更新！</div>}
+            {result.rank && !result.rank.best && result.rank.position >= 0 && (
+              <div className="text-emerald-300 text-sm mt-0.5">自己ベスト {result.rank.position + 1} 位</div>
+            )}
+            {!result.completed && <div className="text-xs text-rose-300 mt-0.5">最後まで走り切ると記録に残ります</div>}
+          </div>
+          {result.rank && result.rank.list.length > 0 && (
+            <div className="pt-2">
+              <div className="text-xs text-slate-400 mb-1">このカテゴリ・方式の自己ベスト</div>
+              <ol className="space-y-0.5">
+                {result.rank.list.map((r, i) => (
+                  <li key={i} className={`flex justify-between text-sm ${i === result.rank.position ? "text-amber-300 font-semibold" : "text-slate-300"}`}>
+                    <span>{i + 1}. <span className="font-mono tabular-nums">{fmtTime(r.timeMs)}</span></span>
+                    <span className="text-slate-500 text-xs">{r.correct}/{r.total}正解</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </div>
+      )}
 
       {wrongCountries.length === 0 ? (
         <div className="rounded-xl border border-emerald-700 bg-emerald-500/10 px-4 py-8 text-center text-emerald-300">
