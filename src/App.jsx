@@ -348,11 +348,44 @@ function normalize(s) {
     .trim()
     .toLowerCase()
     .replace(/[Ａ-Ｚａ-ｚ０-９]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
-    .replace(/[\s・･、。,.\-‐－—’'`]/g, "");
+    .replace(/[ぁ-ゖ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) + 0x60)) // ひらがな→カタカナに統一
+    .replace(/[\s・･、。,.\-‐－—’'`！？!?「」『』（）()【】\[\]"“”]/g, "");
 }
 
 function acceptedAnswers(country) {
   return [country.ja, country.en, ...(country.a || [])].map(normalize);
+}
+
+// 正規化した国名/別名 → 国コード の逆引き。音声モードで「別の国を言った＝不正解」を判定するのに使う。
+const ANSWER_INDEX = new Map();
+for (const _c of COUNTRIES) for (const _a of acceptedAnswers(_c)) if (_a && !ANSWER_INDEX.has(_a)) ANSWER_INDEX.set(_a, _c.c);
+
+// 簡易レーベンシュタイン距離（1文字程度の誤認識・タイプミスを許容するため）。
+function lev(a, b) {
+  const m = a.length, n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  if (Math.abs(m - n) > 2) return 99; // 距離1判定には十分な早期打ち切り
+  let prev = Array.from({ length: n + 1 }, (_, i) => i);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// 入力（音声/テキスト）が country の正解にあたるか判定し、一致した「正解の正規化形」を返す（無ければ null）。
+// 音声認識は表記ゆれ（助詞・句読点付き、1文字違い）が出やすいので、完全一致＋含有＋編集距離1で許容する。
+function matchAccepted(input, country) {
+  const t = normalize(input);
+  if (!t) return null;
+  const accepted = acceptedAnswers(country);
+  for (const a of accepted) if (a && (t === a || t.includes(a))) return a; // 完全一致／助詞・記号が付いても拾う
+  for (const a of accepted) if (a && a.length >= 2 && lev(t, a) <= 1) return a; // 1文字程度の誤りを許容
+  return null;
 }
 
 function shuffle(arr) {
@@ -649,10 +682,10 @@ export default function App() {
     resolve(country.c === current.c, country.c);
   }
 
-  function answerInput() {
-    if (resolved || !text.trim()) return;
-    const ok = acceptedAnswers(current).includes(normalize(text));
-    resolve(ok, text.trim());
+  function answerInput(override) {
+    const val = typeof override === "string" ? override : text;
+    if (resolved || !val.trim()) return;
+    resolve(!!matchAccepted(val, current), val.trim());
   }
 
   async function resetStats() {
@@ -791,6 +824,7 @@ function Header({ screen, onHome, onStats, onAtlas }) {
 function Home({ stats, counts, srs, notice, onDismissNotice, onStart, onLearn }) {
   const [mode, setMode] = useState("choice");
   const [scope, setScope] = useState(["all", "すべて"]);
+  const speechSupported = typeof window !== "undefined" && !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
   const regionBtns = Object.entries(R);
   const learnScopes = [["all", "すべて"], ...regionBtns.map(([k, l]) => [k, l]), ["muslim", "イスラム圏"]];
@@ -808,9 +842,12 @@ function Home({ stats, counts, srs, notice, onDismissNotice, onStart, onLearn })
       {/* 回答方式 */}
       <section>
         <SectionLabel>回答方式</SectionLabel>
-        <div className="grid grid-cols-2 gap-2">
+        <div className={`grid ${speechSupported ? "grid-cols-3" : "grid-cols-2"} gap-2`}>
           <Toggle active={mode === "choice"} onClick={() => setMode("choice")} title="選択式" sub="表示ボタンで4択" />
           <Toggle active={mode === "input"} onClick={() => setMode("input")} title="入力式" sub="国名を入力" />
+          {speechSupported && (
+            <Toggle active={mode === "voice"} onClick={() => setMode("voice")} title="音声式" sub="ハンズフリー" />
+          )}
         </div>
       </section>
 
@@ -935,12 +972,91 @@ function Home({ stats, counts, srs, notice, onDismissNotice, onStart, onLearn })
   );
 }
 
+// 音声入力（Web Speech API）。非対応ブラウザでは supported=false を返し、UIは入力にフォールバックする。
+// 注意: Chrome系ブラウザは内部的に音声をクラウド(Google)へ送って認識する（完全オフラインではない）。
+function useSpeechRecognition({ lang = "ja-JP", onInterim, onResult } = {}) {
+  const SR = typeof window !== "undefined" && (window.SpeechRecognition || window.webkitSpeechRecognition);
+  const [listening, setListening] = useState(false);
+  const [error, setError] = useState(null);
+  const recRef = useRef(null);
+  const cbRef = useRef({ onInterim, onResult });
+  cbRef.current = { onInterim, onResult };
+
+  useEffect(() => () => { try { recRef.current && recRef.current.abort(); } catch (e) {} }, []);
+
+  function start(opts = {}) {
+    if (!SR) return;
+    try { recRef.current && recRef.current.abort(); } catch (e) {}
+    const rec = new SR();
+    rec.lang = lang;
+    rec.interimResults = true;
+    rec.continuous = !!opts.continuous; // 音声モードは true（無音の間も聞き続ける）
+    rec.maxAlternatives = 5;
+    rec.onstart = () => { setError(null); setListening(true); };
+    rec.onerror = (e) => { setError(e.error || "error"); setListening(false); };
+    rec.onend = () => setListening(false);
+    rec.onresult = (e) => {
+      const res = e.results[e.results.length - 1];
+      const alts = Array.from(res).map((a) => a.transcript);
+      if (res.isFinal) cbRef.current.onResult && cbRef.current.onResult(alts[0] || "", alts.slice(1));
+      else cbRef.current.onInterim && cbRef.current.onInterim(alts[0] || "");
+    };
+    recRef.current = rec;
+    try { rec.start(); } catch (e) { setError("start-failed"); setListening(false); }
+  }
+
+  function stop() { try { recRef.current && recRef.current.stop(); } catch (e) {} }
+
+  return { supported: !!SR, listening, error, start, stop };
+}
+
 function Quiz({
   mode, catLabel, country, options, resolved, wasCorrect, picked, revealed, onReveal, hook, text, setText, inputRef, session, onChoice, onInput, onNext, onQuit,
 }) {
   const acc = session.total > 0 ? Math.round((session.correct / session.total) * 100) : 0;
   const [showInfo, setShowInfo] = useState(false);
   useEffect(() => setShowInfo(false), [country.c]); // 問題が変わったら閉じる
+
+  const handsFree = mode === "voice"; // 音声モード（マイクボタン不要・自動で聞き取り）
+
+  // 音声入力: 認識結果を正解と照合し、一致すれば即回答。確定(isFinal)は無音検出を待つぶん遅いので、
+  // 暫定結果(interim)が一致した時点で即確定する。
+  const voice = useSpeechRecognition({
+    lang: "ja-JP",
+    onInterim: (t) => {
+      setText(t);
+      if (matchAccepted(t, country)) { voice.stop(); onInput(t); }
+    },
+    onResult: (best, rest) => {
+      setText(best);
+      const alts = [best, ...rest];
+      const correct = alts.find((a) => matchAccepted(a, country));
+      if (correct) { onInput(correct); return; }
+      // 音声モードのみ: 別の国としてはっきり認識できたら不正解として記録。
+      // どの国にも一致しない（聞き取り不良）ときは確定せず、聞き取りを継続する。
+      if (handsFree) {
+        const wrong = alts.find((a) => ANSWER_INDEX.has(normalize(a)));
+        if (wrong) onInput(wrong);
+      }
+    },
+  });
+
+  // 音声モード: 新しい問題が出たら自動で聞き取り開始し、途切れたら再開（マイクボタン不要）。
+  useEffect(() => {
+    if (!handsFree || !voice.supported || resolved || voice.listening) return;
+    if (voice.error && !["no-speech", "aborted"].includes(voice.error)) return; // 権限/機器/通信エラーはループさせない
+    const id = setTimeout(() => voice.start({ continuous: true }), 250);
+    return () => clearTimeout(id);
+  }, [handsFree, resolved, voice.listening, voice.error, country.c]);
+
+  // 音声モード: 確定したら聞き取りを止め、正解なら自動で次へ（不正解は学習のため手動で進める）。
+  useEffect(() => {
+    if (!handsFree || !resolved) return;
+    voice.stop();
+    if (!wasCorrect) return;
+    const id = setTimeout(() => onNext(), 1400);
+    return () => clearTimeout(id);
+  }, [handsFree, resolved, wasCorrect]);
 
   const optionsGrid = (
     <div className="grid grid-cols-1 gap-2">
@@ -968,7 +1084,7 @@ function Quiz({
   return (
     <div className="space-y-5">
       <div className="flex items-center justify-between text-sm">
-        <span className="px-3 py-1 rounded-full bg-slate-800 text-slate-300">{catLabel} · {mode === "choice" ? "選択式" : "入力式"}</span>
+        <span className="px-3 py-1 rounded-full bg-slate-800 text-slate-300">{catLabel} · {mode === "choice" ? "選択式" : mode === "voice" ? "音声式" : "入力式"}</span>
         <span className="text-slate-400">
           {session.correct}/{session.total}（{acc}%）
         </span>
@@ -998,6 +1114,28 @@ function Quiz({
         )
       ) : (
         <div className="space-y-2">
+          {handsFree && !resolved && (
+            <div className={`rounded-xl px-4 py-3 text-sm flex items-center justify-between gap-3 border ${
+              voice.listening ? "border-rose-500/60 bg-rose-500/10 text-rose-200" : "border-slate-700 bg-slate-900 text-slate-300"
+            }`}>
+              <span>
+                {voice.listening
+                  ? "🎙 聞き取り中… 国名を話してください"
+                  : ["not-allowed", "service-not-allowed", "audio-capture"].includes(voice.error)
+                  ? "マイクを使えません（ブラウザの権限を確認）"
+                  : "🎤 音声モード"}
+              </span>
+              {!voice.listening && (
+                <button
+                  type="button"
+                  onClick={() => voice.start({ continuous: true })}
+                  className="shrink-0 rounded-lg bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-400"
+                >
+                  話す
+                </button>
+              )}
+            </div>
+          )}
           <div className="flex gap-2">
             <input
               ref={inputRef}
@@ -1005,15 +1143,37 @@ function Quiz({
               onChange={(e) => setText(e.target.value)}
               onKeyDown={(e) => e.key === "Enter" && (resolved ? onNext() : onInput())}
               disabled={resolved}
-              placeholder="国名を入力（日本語 / 英語）"
+              placeholder={handsFree ? "話すと認識結果がここに表示されます" : "国名を入力（日本語 / 英語）"}
               className="flex-1 rounded-xl border border-slate-700 bg-slate-900 px-4 py-3 outline-none focus:border-indigo-500 placeholder:text-slate-500 disabled:opacity-60"
             />
+            {voice.supported && !resolved && !handsFree && (
+              <button
+                type="button"
+                onClick={() => { if (voice.listening) voice.stop(); else { setText(""); voice.start(); } }}
+                aria-label="音声で回答"
+                title="音声で回答"
+                className={`rounded-xl px-4 py-3 text-lg transition ${
+                  voice.listening ? "bg-rose-500 text-white animate-pulse" : "bg-slate-700 text-slate-100 hover:bg-slate-600"
+                }`}
+              >
+                🎤
+              </button>
+            )}
             {!resolved && (
-              <button onClick={onInput} className="rounded-xl bg-indigo-500 px-5 py-3 font-medium text-white hover:bg-indigo-400">
+              <button onClick={() => onInput()} className="rounded-xl bg-indigo-500 px-5 py-3 font-medium text-white hover:bg-indigo-400">
                 回答
               </button>
             )}
           </div>
+          {voice.supported && !resolved && !handsFree && (voice.listening || voice.error) && (
+            <p className={`text-xs ${voice.error ? "text-rose-400" : "text-indigo-300"}`}>
+              {voice.listening
+                ? "🎤 聞き取り中… 国名を話してください"
+                : voice.error === "not-allowed" || voice.error === "service-not-allowed"
+                ? "マイクの使用が許可されていません（ブラウザの設定を確認）"
+                : "音声認識に失敗しました。もう一度お試しください"}
+            </p>
+          )}
           {/* わからないとき: 選択肢にフォールバック */}
           {!resolved && !revealed && (
             <button
